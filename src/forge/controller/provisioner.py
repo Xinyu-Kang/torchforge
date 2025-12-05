@@ -357,6 +357,10 @@ class Provisioner:
                 world_size = num_procs * (num_hosts or 1)
                 env_vars["WORLD_SIZE"] = str(world_size)
                 env_vars["CUDA_VISIBLE_DEVICES"] = ",".join(gpu_ids)
+                # On ROCm/AMD stacks, also propagate HIP/HSA visibility.
+                env_vars["HIP_VISIBLE_DEVICES"] = ",".join(gpu_ids)
+                env_vars["HSA_VISIBLE_DEVICES"] = ",".join(gpu_ids)
+                env_vars["ROCR_VISIBLE_DEVICES"] = ",".join(gpu_ids)
 
                 # Inherit Forge-relevant environment variables from the system
                 for env_var in all_env_vars():

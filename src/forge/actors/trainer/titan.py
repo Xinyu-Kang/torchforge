@@ -117,6 +117,30 @@ class TitanTrainer(ForgeActor):
 
     @endpoint
     async def setup(self):
+        # Debug GPU visibility early to fail fast with clear messaging.
+        device_count = torch.cuda.device_count()
+        vis_env = {
+            "CUDA_VISIBLE_DEVICES": os.environ.get("CUDA_VISIBLE_DEVICES"),
+            "HIP_VISIBLE_DEVICES": os.environ.get("HIP_VISIBLE_DEVICES"),
+            "HSA_VISIBLE_DEVICES": os.environ.get("HSA_VISIBLE_DEVICES"),
+            "ROCR_VISIBLE_DEVICES": os.environ.get("ROCR_VISIBLE_DEVICES"),
+        }
+        logger.info(
+            "[TitanTrainer] CUDA available=%s device_count=%s env=%s",
+            torch.cuda.is_available(),
+            device_count,
+            vis_env,
+        )
+        print(
+            f"[TitanTrainer] cuda_available={torch.cuda.is_available()} "
+            f"device_count={device_count} env={vis_env}",
+            flush=True,
+        )
+        if device_count == 0:
+            raise RuntimeError(
+                "TitanTrainer launched with with_gpus=True but no GPUs are visible. "
+                "Check Slurm allocation, drivers, and CUDA_VISIBLE_DEVICES."
+            )
         # TODO: update ForgeEngine to not use ForgeJobConfig
         engine_config = {f.name: getattr(self, f.name) for f in fields(self)}
         for key in {
