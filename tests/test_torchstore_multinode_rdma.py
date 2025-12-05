@@ -2,14 +2,11 @@
 Manual multi-node torchstore RDMA smoke test.
 
 This mirrors the weight-sync pattern that fails in GRPO: storage volumes
-live on one host; a reader on another host pulls a large tensor via torchstore
+live on one host; a reader on another host pulls a tensor via torchstore
 RDMA. It uses the Forge provisioner/Slurm launcher to allocate two hosts.
 
-Usage (manual, opt-in):
-    RUN_TORCHSTORE_MULTINODE_RDMA=1 \
-    TORCHSTORE_RDMA_CHUNK_SIZE_MB=4 \
-    MONARCH_RDMA_TIMEOUT_SECS=60 \
-    pytest torchforge/tests/test_torchstore_multinode_rdma.py -k rdma
+Usage:
+    RUN_TORCHSTORE_MULTINODE_RDMA=1 pytest torchforge/tests/test_torchstore_multinode_rdma.py -k rdma
 
 Environment knobs:
     RUN_TORCHSTORE_MULTINODE_RDMA=1   -> enable the test (otherwise skipped)
@@ -84,17 +81,13 @@ async def test_torchstore_rdma_two_hosts():
     os.environ.setdefault("LOCAL_RANK", "0")
 
     # Propagate PYTHONPATH for completeness, though the torchstore actors live in the installed package.
-    env_vars = {"PYTHONPATH": pythonpath}
-    # Propagate RDMA tuning knobs to remote procs when set.
-    for var in (
-        "MONARCH_RDMA_DEVICE",
-        "MONARCH_RDMA_GID_INDEX",
-        "MONARCH_RDMA_TIMEOUT_SECS",
-        "TORCHSTORE_RDMA_CHUNK_SIZE_MB",
-    ):
-        val = os.environ.get(var)
-        if val is not None and val != "":
-            env_vars[var] = val
+    env_vars = {
+        "PYTHONPATH": pythonpath,
+        "MONARCH_RDMA_TIMEOUT_SECS": os.environ.get("MONARCH_RDMA_TIMEOUT_SECS", "60"),
+        "TORCHSTORE_RDMA_CHUNK_SIZE_MB": os.environ.get("TORCHSTORE_RDMA_CHUNK_SIZE_MB", "4"),
+        "RUST_LOG": os.environ.get("RUST_LOG", "info,monarch_rdma=trace,monarch=trace"),
+        "MONARCH_DEBUG_RDMA": os.environ.get("MONARCH_DEBUG_RDMA", "1"),
+    }
 
     # Allocate a 1-proc storage mesh on a remote host.
     store_procs = await provisioner.get_proc_mesh(
