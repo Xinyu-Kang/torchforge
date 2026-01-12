@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import os
 import sys
@@ -45,13 +46,17 @@ from vllm.config import VllmConfig
 
 from vllm.engine.arg_utils import EngineArgs
 from vllm.entrypoints.utils import _validate_truncation_size
-from vllm.executor.multiproc_worker_utils import set_multiprocessing_worker_envs
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.sampling_params import RequestOutputKind, SamplingParams
-from vllm.transformers_utils.tokenizer_group import init_tokenizer_from_configs
 from vllm.usage.usage_lib import UsageContext
-from vllm.utils import get_distributed_init_method
-from vllm.v1.core.kv_cache_utils import get_kv_cache_config
+try:
+    # vLLM versions exposing the singular helper
+    from vllm.v1.core.kv_cache_utils import get_kv_cache_config as _get_kv_cache_config_impl
+except ImportError:
+    # vLLM 0.13+ renamed to plural
+    from vllm.v1.core.kv_cache_utils import (
+        get_kv_cache_configs as _get_kv_cache_config_impl,
+    )
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.engine import EngineCoreOutputs, EngineCoreRequest
@@ -62,7 +67,185 @@ from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request
 from vllm.v1.structured_output import StructuredOutputManager
-from vllm.worker.worker_base import WorkerWrapperBase
+try:
+    # Older vLLM layout
+    from vllm.worker.worker_base import WorkerWrapperBase
+except ModuleNotFoundError:
+    # vLLM v1 layout
+    from vllm.v1.worker.worker_base import WorkerWrapperBase
+
+try:
+    # Older vLLM exposed this at vllm.utils
+    from vllm.utils import get_distributed_init_method
+except ImportError:
+    # Newer versions keep it under network_utils
+    from vllm.utils.network_utils import get_distributed_init_method
+
+try:
+    # vLLM <1 import path
+    from vllm.executor.multiproc_worker_utils import (
+        set_multiprocessing_worker_envs as _set_mp_envs,
+    )
+except ModuleNotFoundError:
+    # vLLM v1 import path (0.13+)
+    from vllm.v1.executor.multiproc_executor import (
+        set_multiprocessing_worker_envs as _set_mp_envs,
+    )
+
+try:
+    # Newer vLLM location
+    from vllm.tokenizers import get_tokenizer as _get_tokenizer
+except ImportError:
+    # Older/deprecated location
+    from vllm.transformers_utils.tokenizer import get_tokenizer as _get_tokenizer
+
+
+def set_multiprocessing_worker_envs_compat(parallel_config=None):
+    """Handle signature differences between vLLM versions."""
+    sig = inspect.signature(_set_mp_envs)
+    if len(sig.parameters) == 0:
+        return _set_mp_envs()
+    return _set_mp_envs(parallel_config)
+
+
+def _filter_supported_kwargs(fn, **kwargs):
+    """Return kwargs supported by fn (guards vLLM version drift)."""
+    sig = inspect.signature(fn)
+    return {k: v for k, v in kwargs.items() if v is not None and k in sig.parameters}
+
+
+def _get_tokenizer_compat(get_tokenizer_fn, tokenizer_name: str, **kwargs):
+    """Call get_tokenizer across vLLM versions with either tokenizer_name or tokenizer."""
+    sig = inspect.signature(get_tokenizer_fn)
+    params = sig.parameters
+    filtered = _filter_supported_kwargs(get_tokenizer_fn, **kwargs)
+
+    if "tokenizer_name" in params:
+        return get_tokenizer_fn(tokenizer_name=tokenizer_name, **filtered)
+    if "tokenizer" in params:
+        return get_tokenizer_fn(tokenizer=tokenizer_name, **filtered)
+    # Fallback: pass positionally
+    return get_tokenizer_fn(tokenizer_name, **filtered)
+
+
+def _get_default_mm_registry():
+    """Return a multimodal registry instance/constant if available."""
+    try:
+        from vllm.multimodal.registry import MULTIMODAL_REGISTRY
+
+        return MULTIMODAL_REGISTRY
+    except Exception:
+        pass
+    try:
+        from vllm.multimodal.registry import MultiModalRegistry
+
+        return MultiModalRegistry()
+    except Exception:
+        pass
+    try:
+        from vllm.multimodal import MULTIMODAL_REGISTRY
+
+        return MULTIMODAL_REGISTRY
+    except Exception:
+        pass
+    return None
+
+
+def _construct_processor(vllm_config, tokenizer):
+    """Build Processor while handling mm_registry / signature shifts."""
+    mm_registry = _get_default_mm_registry()
+    sig = inspect.signature(Processor)
+    kwargs = {}
+    if "vllm_config" in sig.parameters:
+        kwargs["vllm_config"] = vllm_config
+    elif "config" in sig.parameters:
+        kwargs["config"] = vllm_config
+
+    if "tokenizer" in sig.parameters:
+        kwargs["tokenizer"] = tokenizer
+
+    if mm_registry is not None:
+        if "mm_registry" in sig.parameters:
+            kwargs["mm_registry"] = mm_registry
+        elif "multimodal_registry" in sig.parameters:
+            kwargs["multimodal_registry"] = mm_registry
+
+    if kwargs:
+        return Processor(**kwargs)
+
+    # Fallback to positional in case of unexpected signature
+    return Processor(vllm_config, tokenizer, mm_registry)
+
+
+def get_kv_cache_config_compat(vllm_config, kv_cache_spec, available_memory):
+    """Compat wrapper around vLLM KV cache config helpers (singular vs plural API)."""
+    params = inspect.signature(_get_kv_cache_config_impl).parameters
+    if "kv_cache_specs" in params:
+        # Newer plural API expects lists, returns list
+        configs = _get_kv_cache_config_impl(
+            vllm_config, [kv_cache_spec], [available_memory]
+        )
+        return configs[0]
+    # Older singular API
+    return _get_kv_cache_config_impl(vllm_config, kv_cache_spec, available_memory)
+
+
+def _construct_scheduler(
+    vllm_config,
+    kv_cache_config,
+    structured_output_manager,
+    *,
+    include_finished_set=False,
+    log_stats=None,
+):
+    """Build Scheduler across vLLM signature changes (e.g., block_size required)."""
+    sig = inspect.signature(Scheduler)
+    params = sig.parameters
+    kwargs = {}
+
+    if "vllm_config" in params:
+        kwargs["vllm_config"] = vllm_config
+    if "kv_cache_config" in params:
+        kwargs["kv_cache_config"] = kv_cache_config
+    if "structured_output_manager" in params:
+        kwargs["structured_output_manager"] = structured_output_manager
+
+    block_size = getattr(kv_cache_config, "block_size", None) or getattr(
+        getattr(vllm_config, "cache_config", None), "block_size", None
+    )
+    if "block_size" in params and block_size is not None:
+        kwargs["block_size"] = block_size
+
+    mm_registry = _get_default_mm_registry()
+    if mm_registry is not None:
+        if "mm_registry" in params:
+            kwargs["mm_registry"] = mm_registry
+        elif "multimodal_registry" in params:
+            kwargs["multimodal_registry"] = mm_registry
+
+    if "include_finished_set" in params:
+        kwargs["include_finished_set"] = include_finished_set
+    if "log_stats" in params and log_stats is not None:
+        kwargs["log_stats"] = log_stats
+
+    # Attempt kwargs first; fall back to positional if needed.
+    try:
+        return Scheduler(**kwargs)
+    except TypeError:
+        pass
+
+    # Positional fallback with best-effort ordering.
+    args = []
+    for name in params:
+        if name == "vllm_config":
+            args.append(vllm_config)
+        elif name == "kv_cache_config":
+            args.append(kv_cache_config)
+        elif name == "structured_output_manager":
+            args.append(structured_output_manager)
+        elif name == "block_size":
+            args.append(block_size)
+    return Scheduler(*args)
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -204,14 +387,19 @@ class Generator(ForgeActor):
         # Setup processors
         # TODO: move all processing to the Environment
         # TODO: add support for `log_stats` and `mm_registry`
-        tokenizer = init_tokenizer_from_configs(
-            model_config=self.vllm_config.model_config,
-            scheduler_config=self.vllm_config.scheduler_config,
-            lora_config=self.vllm_config.lora_config,
+        tokenizer_name = (
+            getattr(self.engine_args, "tokenizer", None)
+            or getattr(self.engine_args, "model", None)
         )
-        self.processor = Processor(
-            vllm_config=self.vllm_config, tokenizer=tokenizer, mm_registry=None
+        tokenizer = _get_tokenizer_compat(
+            _get_tokenizer,
+            tokenizer_name=tokenizer_name,
+            tokenizer_mode=getattr(self.engine_args, "tokenizer_mode", None),
+            trust_remote_code=getattr(self.engine_args, "trust_remote_code", None),
+            revision=getattr(self.engine_args, "revision", None),
+            tokenizer_revision=getattr(self.engine_args, "tokenizer_revision", None),
         )
+        self.processor = _construct_processor(self.vllm_config, tokenizer)
         self.output_processor = OutputProcessor(tokenizer, log_stats=None)
 
         # Configure KV caches
@@ -223,10 +411,10 @@ class Generator(ForgeActor):
         # Setup scheduler
         # TODO: Add support for `log_stats`
         structured_output_manager = StructuredOutputManager(self.vllm_config)
-        self.scheduler = Scheduler(
-            vllm_config=self.vllm_config,
-            kv_cache_config=kv_cache_config,
-            structured_output_manager=structured_output_manager,
+        self.scheduler = _construct_scheduler(
+            self.vllm_config,
+            kv_cache_config,
+            structured_output_manager,
             include_finished_set=False,
             log_stats=None,
         )
@@ -326,7 +514,7 @@ class Generator(ForgeActor):
             truncate_prompt_tokens,
             tokenization_kwargs,
         )
-        prompt_str, request = self.processor.process_inputs(
+        processed = self.processor.process_inputs(
             request_id=request_id,
             prompt={"prompt": prompt},
             params=params,
@@ -336,6 +524,16 @@ class Generator(ForgeActor):
             priority=priority,
             data_parallel_rank=None,  # We do not support DP
         )
+        if isinstance(processed, tuple):
+            prompt_str, request = processed
+        else:
+            request = processed
+            prompt_str = (
+                getattr(request, "prompt", None)
+                or getattr(request, "prompt_str", None)
+                or getattr(request, "text", None)
+                or (prompt if isinstance(prompt, str) else str(prompt))
+            )
         t.step("process_inputs")
 
         # Wait until we're accepting requests (releases lock while waiting)
@@ -400,9 +598,10 @@ class Generator(ForgeActor):
         """(forge/issues/332) Will require attention when we bump vllm versions
         https://github.com/vllm-project/vllm/blob/0e3bb543f064eb416bca4f6f3013efa3830b12f7/vllm/v1/engine/core.py#L419
         """
-        if request.mm_hashes is not None:
+        mm_hashes = getattr(request, "mm_hashes", None)
+        if mm_hashes is not None:
             raise NotImplementedError("Support for mm_hash is not implemented yet.")
-        req = Request.from_engine_core_request(request)
+        req = Request.from_engine_core_request(request, block_hasher=None)
         if req.use_structured_output:
             self.scheduler.structured_output_manager.grammar_init(request)
         return req, 0
@@ -419,6 +618,13 @@ class Generator(ForgeActor):
 
             # The results of `execute_model` are gathered on the driver rank (rank 0)
             _, worker_output = next(worker_outputs.items())
+
+            # vLLM v1 may return None from execute_model when using async mode
+            # In this case, we need to call sample_tokens to get the actual output
+            if worker_output is None:
+                worker_outputs = await self.worker.sample_tokens.call(None)
+                _, worker_output = next(worker_outputs.items())
+
             outputs = self.scheduler.update_from_output(scheduler_output, worker_output)
             outputs = outputs.get(0) or EngineCoreOutputs()
             await asyncio.sleep(0)  # Release control before processing outputs
@@ -612,7 +818,7 @@ class GeneratorWorker(ForgeActor):
         self.rank = current_rank().rank
         os.environ["RANK"] = str(self.rank)
         parallel_config = self.vllm_config.parallel_config
-        set_multiprocessing_worker_envs(parallel_config)
+        set_multiprocessing_worker_envs_compat(parallel_config)
         ip, port = os.getenv("MASTER_ADDR"), os.getenv("MASTER_PORT")
         distributed_init_method = get_distributed_init_method(ip, port)
         all_kwargs = [{}] * parallel_config.world_size
@@ -641,7 +847,7 @@ class GeneratorWorker(ForgeActor):
             available_gpu_memory = 0
 
         # Get the kv cache tensor size
-        kv_cache_config = get_kv_cache_config(
+        kv_cache_config = get_kv_cache_config_compat(
             self.vllm_config, kv_cache_spec, available_gpu_memory
         )
         # TODO: unify configs across TorchStore
@@ -661,6 +867,11 @@ class GeneratorWorker(ForgeActor):
     @endpoint
     async def execute_model(self, schedule: SchedulerOutput) -> ModelRunnerOutput:
         return self.worker.execute_model(schedule)
+
+    @endpoint
+    async def sample_tokens(self, grammar_output) -> ModelRunnerOutput:
+        """Sample tokens after execute_model returns None (vLLM v1 async mode)."""
+        return self.worker.sample_tokens(grammar_output)
 
     @endpoint
     async def update_weights(
