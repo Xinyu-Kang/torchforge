@@ -419,6 +419,13 @@ class Generator(ForgeActor):
 
             # The results of `execute_model` are gathered on the driver rank (rank 0)
             _, worker_output = next(worker_outputs.items())
+
+            # vLLM v1 may return None from execute_model when using async mode
+            # In this case, we need to call sample_tokens to get the actual output
+            if worker_output is None:
+                worker_outputs = await self.worker.sample_tokens.call(None)
+                _, worker_output = next(worker_outputs.items())
+
             outputs = self.scheduler.update_from_output(scheduler_output, worker_output)
             outputs = outputs.get(0) or EngineCoreOutputs()
             await asyncio.sleep(0)  # Release control before processing outputs
@@ -661,6 +668,11 @@ class GeneratorWorker(ForgeActor):
     @endpoint
     async def execute_model(self, schedule: SchedulerOutput) -> ModelRunnerOutput:
         return self.worker.execute_model(schedule)
+
+    @endpoint
+    async def sample_tokens(self, grammar_output) -> ModelRunnerOutput:
+        """Sample tokens after execute_model returns None (vLLM v1 async mode)."""
+        return self.worker.sample_tokens(grammar_output)
 
     @endpoint
     async def update_weights(
