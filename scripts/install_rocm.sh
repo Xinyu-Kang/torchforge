@@ -47,14 +47,11 @@ if [ -z "${TORCHTITAN_VERSION:-}" ]; then
     log_error "TORCHTITAN_VERSION not set in $VERSIONS_FILE"
     exit 1
 fi
-if [ -z "${MONARCH_VERSION:-}" ]; then
-    log_error "MONARCH_VERSION not set in $VERSIONS_FILE"
-    exit 1
-fi
 
 # Defaults (override via environment variables)
-FORGE_DEPS_DIR="${FORGE_DEPS_DIR:-$HOME/.cache/torchforge}"
+FORGE_DEPS_DIR="${FORGE_DEPS_DIR:-$HOME/.cache/torchforge${CONDA_DEFAULT_ENV:+-$CONDA_DEFAULT_ENV}}"
 PYTORCH_CHANNEL="${PYTORCH_CHANNEL:-auto}" # auto|stable|nightly
+MONARCH_REF="${MONARCH_REF:-hipify}"
 
 # Check conda environment
 check_conda_env() {
@@ -161,7 +158,7 @@ install_system_packages() {
     else
         # Default to conda installation
         log_info "Installing system packages via conda (default method)"
-        conda install -c conda-forge rdma-core libibverbs-cos7-x86_64 libunwind clang libprotobuf -y
+        conda install -c conda-forge rdma-core libibverbs-cos7-x86_64 libunwind clang libprotobuf compilers -y
         log_info "Conda package installation completed. Packages installed in conda environment."
     fi
 }
@@ -308,6 +305,33 @@ install_pytorch() {
     fi
 }
 
+disable_torch_libamdhip64() {
+    log_info "Disabling libamdhip64.so inside torch"
+
+    local torch_dir=""
+    if ! torch_dir=$(python - <<'PY'
+import os
+import torch
+print(os.path.dirname(torch.__file__))
+PY
+); then
+        log_error "Failed to locate torch installation directory"
+        exit 1
+    fi
+
+    local found=false
+    for f in "$torch_dir"/lib/libamdhip64.so*; do
+        if [ -e "$f" ]; then
+            mv -v "$f" "$f.disabled"
+            found=true
+        fi
+    done
+
+    if [ "$found" = "false" ]; then
+        log_warning "No libamdhip64.so* files found under ${torch_dir}/lib"
+    fi
+}
+
 install_vllm() {
     local vllm_dir="${FORGE_DEPS_DIR}/vllm"
 
@@ -334,17 +358,22 @@ install_torchtitan() {
 
 install_monarch() {
     local monarch_dir="${FORGE_DEPS_DIR}/monarch"
+    local monarch_ref="${MONARCH_REF}"
 
-    log_info "Installing Monarch ${MONARCH_VERSION} from source"
-    ensure_repo "https://github.com/meta-pytorch/monarch.git" "$monarch_dir" "$MONARCH_VERSION"
+    log_info "Installing Monarch ${monarch_ref} from source"
+    ensure_repo "https://github.com/zstreet87/monarch.git" "$monarch_dir" ""
+    if git -C "$monarch_dir" show-ref --verify --quiet "refs/remotes/origin/${monarch_ref}"; then
+        git -C "$monarch_dir" checkout -B "$monarch_ref" "origin/$monarch_ref"
+    else
+        git -C "$monarch_dir" checkout "$monarch_ref"
+    fi
+    git -C "$monarch_dir" submodule update --init --recursive
 
-    python -m pip install -r "${monarch_dir}/build-requirements.txt"
     if ! ulimit -n 2048; then
         log_warning "Unable to raise open file limit to 2048, continuing anyway"
     fi
 
-    # ROCm builds disable tensor_engine (RDMA/distributed tensor features).
-    USE_TENSOR_ENGINE=0 LIBRARY_PATH="${CONDA_PREFIX}/lib${LIBRARY_PATH:+:$LIBRARY_PATH}" \
+    USE_ROCM=1 LIBRARY_PATH="${CONDA_PREFIX}/lib${LIBRARY_PATH:+:$LIBRARY_PATH}" \
         python -m pip install --no-build-isolation -e "$monarch_dir"
 }
 
@@ -447,6 +476,11 @@ install_forge() {
     fi
 }
 
+pin_python_deps() {
+    log_info "Pinning transformers and numpy versions"
+    python -m pip install --no-deps "transformers==4.57.6" "numpy==2.2.*"
+}
+
 setup_rocm_env() {
     local conda_env_dir="${CONDA_PREFIX}"
 
@@ -464,6 +498,42 @@ setup_rocm_env() {
 export PYTORCH_ROCM_ARCH="${PYTORCH_ROCM_ARCH}"
 export VLLM_TARGET_DEVICE="rocm"
 export USE_ROCM="1"
+
+# Prepend conda libs and keep prior value for restore on deactivate.
+if [ -n "\${LD_LIBRARY_PATH+x}" ]; then
+  export TORCHFORGE_OLD_LD_LIBRARY_PATH="\${LD_LIBRARY_PATH}"
+else
+  export TORCHFORGE_OLD_LD_LIBRARY_PATH="__TORCHFORGE_UNSET__"
+fi
+export LD_LIBRARY_PATH="\${CONDA_PREFIX}/lib\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}"
+
+# Set XDG runtime dir for ROCm tooling.
+if [ -n "\${XDG_RUNTIME_DIR+x}" ]; then
+  export TORCHFORGE_OLD_XDG_RUNTIME_DIR="\${XDG_RUNTIME_DIR}"
+else
+  export TORCHFORGE_OLD_XDG_RUNTIME_DIR="__TORCHFORGE_UNSET__"
+fi
+export XDG_RUNTIME_DIR="/tmp"
+
+# Clear device visibility so ROCm can see all GPUs.
+if [ -n "\${CUDA_VISIBLE_DEVICES+x}" ]; then
+  export TORCHFORGE_OLD_CUDA_VISIBLE_DEVICES="\${CUDA_VISIBLE_DEVICES}"
+else
+  export TORCHFORGE_OLD_CUDA_VISIBLE_DEVICES="__TORCHFORGE_UNSET__"
+fi
+if [ -n "\${HIP_VISIBLE_DEVICES+x}" ]; then
+  export TORCHFORGE_OLD_HIP_VISIBLE_DEVICES="\${HIP_VISIBLE_DEVICES}"
+else
+  export TORCHFORGE_OLD_HIP_VISIBLE_DEVICES="__TORCHFORGE_UNSET__"
+fi
+if [ -n "\${ROCR_VISIBLE_DEVICES+x}" ]; then
+  export TORCHFORGE_OLD_ROCR_VISIBLE_DEVICES="\${ROCR_VISIBLE_DEVICES}"
+else
+  export TORCHFORGE_OLD_ROCR_VISIBLE_DEVICES="__TORCHFORGE_UNSET__"
+fi
+unset CUDA_VISIBLE_DEVICES
+unset HIP_VISIBLE_DEVICES
+unset ROCR_VISIBLE_DEVICES
 EOF
 
     cat > "${conda_env_dir}/etc/conda/deactivate.d/rocm_env.sh" << 'EOF'
@@ -471,9 +541,44 @@ EOF
 unset PYTORCH_ROCM_ARCH
 unset VLLM_TARGET_DEVICE
 unset USE_ROCM
+
+if [ "${TORCHFORGE_OLD_LD_LIBRARY_PATH:-__TORCHFORGE_UNSET__}" = "__TORCHFORGE_UNSET__" ]; then
+  unset LD_LIBRARY_PATH
+else
+  export LD_LIBRARY_PATH="${TORCHFORGE_OLD_LD_LIBRARY_PATH}"
+fi
+unset TORCHFORGE_OLD_LD_LIBRARY_PATH
+
+if [ "${TORCHFORGE_OLD_XDG_RUNTIME_DIR:-__TORCHFORGE_UNSET__}" = "__TORCHFORGE_UNSET__" ]; then
+  unset XDG_RUNTIME_DIR
+else
+  export XDG_RUNTIME_DIR="${TORCHFORGE_OLD_XDG_RUNTIME_DIR}"
+fi
+unset TORCHFORGE_OLD_XDG_RUNTIME_DIR
+
+if [ "${TORCHFORGE_OLD_CUDA_VISIBLE_DEVICES:-__TORCHFORGE_UNSET__}" = "__TORCHFORGE_UNSET__" ]; then
+  unset CUDA_VISIBLE_DEVICES
+else
+  export CUDA_VISIBLE_DEVICES="${TORCHFORGE_OLD_CUDA_VISIBLE_DEVICES}"
+fi
+unset TORCHFORGE_OLD_CUDA_VISIBLE_DEVICES
+
+if [ "${TORCHFORGE_OLD_HIP_VISIBLE_DEVICES:-__TORCHFORGE_UNSET__}" = "__TORCHFORGE_UNSET__" ]; then
+  unset HIP_VISIBLE_DEVICES
+else
+  export HIP_VISIBLE_DEVICES="${TORCHFORGE_OLD_HIP_VISIBLE_DEVICES}"
+fi
+unset TORCHFORGE_OLD_HIP_VISIBLE_DEVICES
+
+if [ "${TORCHFORGE_OLD_ROCR_VISIBLE_DEVICES:-__TORCHFORGE_UNSET__}" = "__TORCHFORGE_UNSET__" ]; then
+  unset ROCR_VISIBLE_DEVICES
+else
+  export ROCR_VISIBLE_DEVICES="${TORCHFORGE_OLD_ROCR_VISIBLE_DEVICES}"
+fi
+unset TORCHFORGE_OLD_ROCR_VISIBLE_DEVICES
 EOF
 
-    # DO NOT set LD_LIBRARY_PATH globally; use a Python-only shim like CUDA install.sh.
+    # Keep a Python-only LD_LIBRARY_PATH shim for ROCm Torch libs.
     local py_shim_activate="${conda_env_dir}/etc/conda/activate.d/python_ld_shim.sh"
     cat > "$py_shim_activate" << 'EOF'
 # Python-only LD_LIBRARY_PATH shim for ROCm Torch libs.
@@ -582,12 +687,14 @@ main() {
     log_info "Detected PYTORCH_ROCM_ARCH: ${PYTORCH_ROCM_ARCH}"
 
     install_pytorch
+    disable_torch_libamdhip64
     install_vllm
     install_torchstore
     install_torchtitan
     ensure_rust
     install_monarch
     install_forge
+    pin_python_deps
     setup_rocm_env
 
     # Test installation
