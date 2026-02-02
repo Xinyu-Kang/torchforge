@@ -729,11 +729,11 @@ main() {
     log_info "Detected ROCm version: ${ROCM_VERSION}"
     log_info "Detected PYTORCH_ROCM_ARCH: ${PYTORCH_ROCM_ARCH}"
 
-    # install_pytorch
-    # install_vllm
-    # install_torchstore
-    # install_torchtitan
-    # ensure_rust
+    install_pytorch
+    install_vllm
+    install_torchstore
+    install_torchtitan
+    ensure_rust
     install_monarch
     install_forge
     pin_python_deps
