@@ -163,6 +163,25 @@ install_system_packages() {
     fi
 }
 
+ensure_conda_build_tools() {
+    if [ -z "${CONDA_PREFIX:-}" ]; then
+        log_error "CONDA_PREFIX not set; cannot ensure conda build tools"
+        exit 1
+    fi
+
+    # Prefer conda tools over ~/.local
+    export PATH="${CONDA_PREFIX}/bin:${PATH}"
+    hash -r 2>/dev/null || true
+
+    log_info "Ensuring cmake/ninja are installed in conda env"
+    conda install -c conda-forge -y cmake ninja
+
+    log_info "cmake: $(command -v cmake)"
+    cmake --version | head -n 1
+    log_info "ninja: $(command -v ninja)"
+    ninja --version
+}
+
 detect_rocm_version() {
     if [ -n "${ROCM_VERSION:-}" ]; then
         echo "$ROCM_VERSION"
@@ -339,9 +358,30 @@ install_vllm() {
     ensure_repo "https://github.com/vllm-project/vllm.git" "$vllm_dir" "$VLLM_ROCM_VERSION"
 
     python -m pip install -r "${vllm_dir}/requirements/rocm.txt"
-    python -m pip install --upgrade "cmake>=3.27" ninja
     install_amdsmi
 
+    local sysroot="${CONDA_PREFIX}/x86_64-conda-linux-gnu/sysroot"
+    local gcc_libdir=""
+    local cflags=""
+    local cxxflags=""
+    local ldflags=""
+    local libpath=""
+
+    if [ -d "$sysroot" ]; then
+        gcc_libdir=$(ls -d "${CONDA_PREFIX}/lib/gcc/x86_64-conda-linux-gnu/"* 2>/dev/null | head -n 1 || true)
+        cflags="--sysroot=${sysroot}"
+        cxxflags="--sysroot=${sysroot}"
+        ldflags="--sysroot=${sysroot} -L${sysroot}/lib64 -L${sysroot}/usr/lib64 -L${CONDA_PREFIX}/lib${gcc_libdir:+ -L${gcc_libdir}}"
+        libpath="${sysroot}/lib64:${sysroot}/usr/lib64:${CONDA_PREFIX}/lib${gcc_libdir:+:${gcc_libdir}}"
+        log_info "Using conda sysroot for vLLM build: ${sysroot}"
+    else
+        log_warning "Conda sysroot not found at ${sysroot}; vLLM build may fail"
+    fi
+
+    CFLAGS="${cflags}${CFLAGS:+ $CFLAGS}" \
+    CXXFLAGS="${cxxflags}${CXXFLAGS:+ $CXXFLAGS}" \
+    LDFLAGS="${ldflags}${LDFLAGS:+ $LDFLAGS}" \
+    LIBRARY_PATH="${libpath}${LIBRARY_PATH:+:$LIBRARY_PATH}" \
     VLLM_TARGET_DEVICE=rocm PYTORCH_ROCM_ARCH="${PYTORCH_ROCM_ARCH}" \
         python -m pip install -e "$vllm_dir" --no-build-isolation
 }
@@ -372,6 +412,8 @@ install_monarch() {
     if ! ulimit -n 2048; then
         log_warning "Unable to raise open file limit to 2048, continuing anyway"
     fi
+
+    python -m pip install setuptools-rust
 
     USE_ROCM=1 LIBRARY_PATH="${CONDA_PREFIX}/lib${LIBRARY_PATH:+:$LIBRARY_PATH}" \
         python -m pip install --no-build-isolation -e "$monarch_dir"
@@ -676,6 +718,7 @@ main() {
 
     # Install build prerequisites
     install_system_packages "$USE_SUDO"
+    ensure_conda_build_tools
 
     ROCM_VERSION="$(detect_rocm_version)"
     PYTORCH_ROCM_ARCH="$(detect_rocm_arch)"
@@ -686,15 +729,15 @@ main() {
     log_info "Detected ROCm version: ${ROCM_VERSION}"
     log_info "Detected PYTORCH_ROCM_ARCH: ${PYTORCH_ROCM_ARCH}"
 
-    install_pytorch
-    disable_torch_libamdhip64
-    install_vllm
-    install_torchstore
-    install_torchtitan
-    ensure_rust
+    # install_pytorch
+    # install_vllm
+    # install_torchstore
+    # install_torchtitan
+    # ensure_rust
     install_monarch
     install_forge
     pin_python_deps
+    disable_torch_libamdhip64
     setup_rocm_env
 
     # Test installation
