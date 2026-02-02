@@ -14,9 +14,9 @@ compile: true # Enable torch.compile for trainer/ref_model, and CUDA graphs for 
 provisioner:
   launcher: slurm
   slurm_args:
-    account: agentic-models
-    qos: h200_capabilities_shared
-  mem: 2047962M
+    partition: amd-rccl
+    qos: normal
+  mem: 2000000M
   cpus_per_task: 192
   job_name: qwen3_8b
 
@@ -50,6 +50,7 @@ generator:
     max_tokens: ${max_res_tokens}
     temperature: 1.0
     top_p: 1.0
+    logprobs: 1
 
 # Trainer configuration
 trainer:
@@ -136,12 +137,12 @@ services:
     hosts: 1
     with_gpus: true
     mesh_name: generator
-  ref_model:
-    procs: 1
-    num_replicas: 1
-    hosts: 1
-    with_gpus: true
-    mesh_name: ref_model
+  # ref_model:
+  #   procs: 1
+  #   num_replicas: 1
+  #   hosts: 1
+  #   with_gpus: true
+  #   mesh_name: ref_model
   reward_actor:
     procs: 1
     num_replicas: 1

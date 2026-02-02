@@ -322,6 +322,20 @@ class Provisioner:
         if env_vars is None:
             env_vars = {}
 
+        # Isolate vLLM's compile cache per proc mesh (replica) to avoid collisions.
+        if "VLLM_CACHE_ROOT" not in env_vars and mesh_name:
+            user = os.environ.get("USER", "unknown")
+            job_id = os.environ.get("SLURM_JOB_ID") or os.environ.get(
+                "SLURM_STEP_ID", "local"
+            )
+            computed_cache_root = os.path.join(
+                "/tmp", user, "vllm_cache", job_id, mesh_name
+            )
+            env_vars.setdefault(
+                "VLLM_CACHE_ROOT",
+                os.environ.get("VLLM_CACHE_ROOT", computed_cache_root),
+            )
+
         is_remote = num_hosts is not None and num_hosts > 0
 
         async with self._lock:
@@ -357,6 +371,13 @@ class Provisioner:
                 world_size = num_procs * (num_hosts or 1)
                 env_vars["WORLD_SIZE"] = str(world_size)
                 env_vars["CUDA_VISIBLE_DEVICES"] = ",".join(gpu_ids)
+                if torch.version.hip:
+                    env_vars["HIP_VISIBLE_DEVICES"] = env_vars["CUDA_VISIBLE_DEVICES"]
+
+                if is_remote:
+                    logger.info(f"Allocated GPUs {gpu_ids} for mesh '{mesh_name}' (host_id: {host_id})")
+                else:
+                    logger.info(f"Allocated GPUs {gpu_ids} for mesh '{mesh_name}'")
 
                 # Inherit Forge-relevant environment variables from the system
                 for env_var in all_env_vars():
