@@ -109,6 +109,7 @@ class LauncherConfig:
     job_name: str = ""
     services: dict[str, ServiceConfig] = field(default_factory=dict)
     actors: dict[str, ProcessConfig] = field(default_factory=dict)
+    python_exe: str | None = None # Optional wrapper for the worker bootstrap command
     slurm_args: dict[str, str] = field(default_factory=dict)
     cpus_per_task: int | None = None  # CPUs per node (SLURM param, can get with sinfo)
     mem: int | None = (  # noqa: N815
